@@ -280,7 +280,7 @@ Transcript:
 {segments}"
     );
 
-    let default_model = "google/gemini-2.5-flash".to_string();
+    let default_model = "nvidia/nemotron-3-ultra-550b-a55b:free".to_string();
     let model = model_name
         .filter(|m| !m.trim().is_empty())
         .map(|m| m.trim().to_string())
@@ -298,10 +298,7 @@ Transcript:
                     "content": prompt,
                 }
             ],
-            "temperature": 0.2,
-            "response_format": {
-                "type": "json_object"
-            }
+            "temperature": 0.2
         }))
         .send()
         .await

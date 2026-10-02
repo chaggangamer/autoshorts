@@ -138,7 +138,7 @@ function App() {
     return (localStorage.getItem("autoshorts_transcription_engine") as "deepgram" | "local") || "local";
   });
   const [llmEngine, setLlmEngine] = useState<"claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq">(() => {
-    return (localStorage.getItem("autoshorts_llm_engine") as "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq") || "local";
+    return (localStorage.getItem("autoshorts_llm_engine") as "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq") || "openrouter";
   });
   const [localLlmModel, setLocalLlmModel] = useState(() => {
     return localStorage.getItem("autoshorts_local_llm_model") || "llama3.2";
@@ -168,7 +168,7 @@ function App() {
     return localStorage.getItem("autoshorts_groq_key") || "";
   });
   const [openrouterModel, setOpenrouterModel] = useState(() => {
-    return localStorage.getItem("autoshorts_openrouter_model") || "";
+    return localStorage.getItem("autoshorts_openrouter_model") || "nvidia/nemotron-3-ultra-550b-a55b:free";
   });
 
   const [downloadingModelName, setDownloadingModelName] = useState<string | null>(null);
@@ -227,12 +227,22 @@ function App() {
 
   useEffect(() => {
     void refresh();
-    const value = localStorage.getItem("autoshorts_onboarded");
-    if (value === "true") {
-      setIsOnboarded(true);
-    } else {
-      setIsOnboarded(false);
+
+    if (localStorage.getItem("autoshorts_custom_defaults_applied") !== "true") {
+      const customModel = "nvidia/nemotron-3-ultra-550b-a55b:free";
+
+      setTranscriptionEngine("local");
+      setLlmEngine("openrouter");
+      setOpenrouterModel(customModel);
+
+      localStorage.setItem("autoshorts_transcription_engine", "local");
+      localStorage.setItem("autoshorts_llm_engine", "openrouter");
+      localStorage.setItem("autoshorts_openrouter_model", customModel);
+      localStorage.setItem("autoshorts_custom_defaults_applied", "true");
     }
+
+    localStorage.setItem("autoshorts_onboarded", "true");
+    setIsOnboarded(true);
   }, []);
 
   useEffect(() => {

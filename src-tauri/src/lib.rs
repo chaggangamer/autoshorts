@@ -35,7 +35,7 @@ async fn environment_status(state: tauri::State<'_, AppState>) -> Result<Environ
         .unwrap_or_else(|_| "deepseek".to_string())
         .to_lowercase();
 
-    let has_local_whisper_model = transcription::whisper_cli_exists() || transcription::whisper_python_exists();
+    let has_local_whisper_model = transcription::ffmpeg_whisper_exists();
 
     let has_ollama = reqwest::Client::new()
         .get("http://localhost:11434")
@@ -374,9 +374,9 @@ async fn transcribe_project(
                 .map_err(to_command_error)?
         }
         "local" => {
-            let has_whisper = transcription::whisper_cli_exists() || transcription::whisper_python_exists();
+            let has_whisper = transcription::ffmpeg_whisper_exists();
             if !has_whisper {
-                return Err("Whisper is not installed. Please install it (e.g., via Homebrew 'brew install whisper-cli' or via Python 'pip3 install openai-whisper').".to_string());
+                return Err("FFmpeg is installed, but its whisper.cpp filter is unavailable. Install an FFmpeg build compiled with --enable-whisper.".to_string());
             }
             let audio_path = media::extract_audio(
                 &project.source_path,
