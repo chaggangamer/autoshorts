@@ -324,19 +324,24 @@ function App() {
 
   async function refresh(nextProjectId?: string) {
     setError(null);
+
+    if (nextProjectId) {
+      const [projectList, nextDetail] = await Promise.all([
+        invoke<Project[]>("list_projects"),
+        invoke<ProjectDetail>("get_project_detail", { projectId: nextProjectId }),
+      ]);
+      setProjects(projectList);
+      setDetail(nextDetail);
+      return;
+    }
+
     const [env, projectList] = await Promise.all([
       invoke<EnvironmentStatus>("environment_status"),
       invoke<Project[]>("list_projects"),
     ]);
     setEnvironment(env);
     setProjects(projectList);
-
-    if (nextProjectId) {
-      const nextDetail = await invoke<ProjectDetail>("get_project_detail", { projectId: nextProjectId });
-      setDetail(nextDetail);
-    } else {
-      setDetail(null);
-    }
+    setDetail(null);
   }
 
   async function run(action: BusyState, task: () => Promise<void>) {
@@ -368,20 +373,9 @@ function App() {
 
   async function handleYoutubeImport() {
     if (!youtubeUrl) return;
-    setYoutubeStatus("checking");
-    setError(null);
-    try {
-      const result = await invoke<{isSafe: boolean; license: string | null}>("check_youtube_copyright", { url: youtubeUrl });
-      if (!result.isSafe) {
-        setYoutubeWarningLicense(result.license || "Unknown / Not specified");
-        setYoutubeStatus("warning");
-        return;
-      }
-      await executeYoutubeDownload();
-    } catch (err: any) {
-      setError(err.toString());
-      setYoutubeStatus("idle");
-    }
+
+    // FAST MODE: directly download instead of doing a second yt-dlp metadata request first.
+    await executeYoutubeDownload();
   }
 
   async function executeYoutubeDownload() {
@@ -424,7 +418,7 @@ function App() {
 
   async function runAutoPipeline(projectId: string) {
     setError(null);
-    const env = await invoke<EnvironmentStatus>("environment_status");
+    const env = environment ?? await invoke<EnvironmentStatus>("environment_status");
 
     if (transcriptionEngine === "local") {
       if (!env.hasLocalWhisperModel) {

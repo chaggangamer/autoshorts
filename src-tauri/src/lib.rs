@@ -37,12 +37,7 @@ async fn environment_status(state: tauri::State<'_, AppState>) -> Result<Environ
 
     let has_local_whisper_model = transcription::ffmpeg_whisper_exists();
 
-    let has_ollama = reqwest::Client::new()
-        .get("http://localhost:11434")
-        .timeout(std::time::Duration::from_millis(1000))
-        .send()
-        .await
-        .is_ok();
+    let has_ollama = false; // FAST MODE: Ollama disabled
 
     Ok(EnvironmentStatus {
         data_dir: state.data_dir.to_string_lossy().to_string(),

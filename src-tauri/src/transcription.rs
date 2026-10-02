@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
@@ -138,29 +139,33 @@ pub fn build_segments(words: &[TranscriptWord]) -> Vec<TranscriptSegment> {
 }
 
 pub fn ffmpeg_whisper_exists() -> bool {
-    let output = std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-filters"])
-        .output();
+    static HAS_FFMPEG_WHISPER: OnceLock<bool> = OnceLock::new();
 
-    match output {
-        Ok(output) => {
-            let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            text.lines().any(|line| {
-                let trimmed = line.trim_start();
-                trimmed.starts_with(".. whisper")
-                    || trimmed.starts_with("T. whisper")
-                    || line.contains(" whisper ")
-            })
+    *HAS_FFMPEG_WHISPER.get_or_init(|| {
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-filters"])
+            .output();
+
+        match output {
+            Ok(output) => {
+                let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+                text.lines().any(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.starts_with(".. whisper")
+                        || trimmed.starts_with("T. whisper")
+                        || line.contains(" whisper ")
+                })
+            }
+            Err(_) => false,
         }
-        Err(_) => false,
-    }
+    })
 }
 
 async fn ensure_whisper_model(model_path: &std::path::Path) -> Result<()> {
     const MODEL_URL: &str =
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
-    const MIN_EXPECTED_BYTES: u64 = 100_000_000;
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin";
+    const MIN_EXPECTED_BYTES: u64 = 50_000_000;
 
     if let Ok(meta) = tokio::fs::metadata(model_path).await {
         if meta.len() >= MIN_EXPECTED_BYTES {
@@ -327,7 +332,7 @@ pub async fn transcribe_local(
 
     let model_path = std::path::Path::new(data_dir)
         .join("models")
-        .join("ggml-base.bin");
+        .join("ggml-tiny.bin");
 
     ensure_whisper_model(&model_path).await?;
 
@@ -345,35 +350,49 @@ pub async fn transcribe_local(
     let output_name = format!("autoshorts-whisper-{}.srt", uuid::Uuid::new_v4());
     let output_path = model_dir.join(&output_name);
 
-    let audio_path_owned = audio_path.to_string();
-    let model_dir_for_command = model_dir.clone();
-    let filter = format!(
-        "whisper=model={}:language=lock:queue=10:use_gpu=false:destination={}:format=srt",
-        model_name, output_name
-    );
+    let run_whisper = |use_gpu: bool| {
+        let audio_path_owned = audio_path.to_string();
+        let model_dir_for_command = model_dir.clone();
+        let model_name = model_name.clone();
+        let output_name = output_name.clone();
 
-    let output = tokio::task::spawn_blocking(move || -> Result<std::process::Output> {
-        let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        tokio::task::spawn_blocking(move || -> Result<std::process::Output> {
+            let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
+            let filter = format!(
+                "whisper=model={}:language=lock:queue=20:use_gpu={}:destination={}:format=srt",
+                model_name,
+                if use_gpu { "true" } else { "false" },
+                output_name
+            );
 
-        std::process::Command::new("ffmpeg")
-            .current_dir(&model_dir_for_command)
-            .arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("warning")
-            .arg("-y")
-            .arg("-i")
-            .arg(&audio_path_owned)
-            .arg("-vn")
-            .arg("-af")
-            .arg(&filter)
-            .arg("-f")
-            .arg("null")
-            .arg(null_sink)
-            .output()
-            .context("executing FFmpeg Whisper filter")
-    })
-    .await
-    .context("FFmpeg Whisper worker failed")??;
+            std::process::Command::new("ffmpeg")
+                .current_dir(&model_dir_for_command)
+                .arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("warning")
+                .arg("-y")
+                .arg("-i")
+                .arg(&audio_path_owned)
+                .arg("-vn")
+                .arg("-af")
+                .arg(&filter)
+                .arg("-f")
+                .arg("null")
+                .arg(null_sink)
+                .output()
+                .context("executing FFmpeg Whisper filter")
+        })
+    };
+
+    let mut output = run_whisper(true)
+        .await
+        .context("FFmpeg Whisper GPU worker failed")??;
+
+    if !output.status.success() {
+        output = run_whisper(false)
+            .await
+            .context("FFmpeg Whisper CPU fallback worker failed")??;
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

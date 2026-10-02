@@ -13,11 +13,7 @@ pub fn command_exists(name: &str) -> bool {
 }
 
 pub fn probe_media(path: &str) -> Result<MediaProbe> {
-    if !command_exists("ffprobe") {
-        return Err(anyhow!("ffprobe is not installed or not available on PATH"));
-    }
-
-    let output = Command::new("ffprobe")
+let output = Command::new("ffprobe")
         .args([
             "-v",
             "error",
@@ -78,11 +74,7 @@ pub fn probe_media(path: &str) -> Result<MediaProbe> {
 }
 
 pub fn extract_audio(source_path: &str, project_dir: &Path) -> Result<PathBuf> {
-    if !command_exists("ffmpeg") {
-        return Err(anyhow!("ffmpeg is not installed or not available on PATH"));
-    }
-
-    std::fs::create_dir_all(project_dir)?;
+std::fs::create_dir_all(project_dir)?;
     let output_path = project_dir.join("transcription_audio.wav");
 
     let output = Command::new("ffmpeg")
@@ -108,11 +100,7 @@ pub fn render_flat_clip(
     output_path: &Path,
     drawtext_filters: Option<&str>,
 ) -> Result<PathBuf> {
-    if !command_exists("ffmpeg") {
-        return Err(anyhow!("ffmpeg is not installed or not available on PATH"));
-    }
-
-    if let Some(parent) = output_path.parent() {
+if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
@@ -134,7 +122,7 @@ pub fn render_flat_clip(
             }
         }
         cmd.args(["-vf", &filter]);
-        cmd.args(["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"]);
+        cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]);
     } else {
         cmd.arg("-vn");
     }
