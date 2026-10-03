@@ -367,7 +367,8 @@ async fn transcribe_project(
 
     let total_duration_sec = project.source_duration.unwrap_or_else(|| {
         media::probe_media(&project.source_path)
-            .map(|probe| probe.duration_sec)
+            .ok()
+            .and_then(|probe| probe.duration_sec)
             .unwrap_or(0.0)
     });
 
