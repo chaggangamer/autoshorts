@@ -23,6 +23,19 @@ struct PullProgressPayload {
     percentage: Option<f64>,
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptionProgressPayload {
+    project_id: String,
+    processed_sec: f64,
+    total_sec: f64,
+    percentage: f64,
+    elapsed_sec: f64,
+    speed: f64,
+    eta_sec: Option<f64>,
+    using_gpu: bool,
+}
+
 #[derive(Clone)]
 struct AppState {
     db: Database,
@@ -340,6 +353,7 @@ fn extract_project_audio(
 
 #[tauri::command]
 async fn transcribe_project(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     project_id: String,
     provider: String,
@@ -350,6 +364,12 @@ async fn transcribe_project(
     let project = db.get_project(&project_id).map_err(to_command_error)?;
     db.update_project_status(&project_id, "transcribing", None)
         .map_err(to_command_error)?;
+
+    let total_duration_sec = project.source_duration.unwrap_or_else(|| {
+        media::probe_media(&project.source_path)
+            .map(|probe| probe.duration_sec)
+            .unwrap_or(0.0)
+    });
 
     let transcript = match provider.as_str() {
         "deepgram" => {
@@ -378,9 +398,30 @@ async fn transcribe_project(
                 &data_dir.join("projects").join(&project_id),
             )
             .map_err(to_command_error)?;
-            transcription::transcribe_local(&audio_path.to_string_lossy(), &data_dir.to_string_lossy())
-                .await
-                .map_err(to_command_error)?
+            let app_handle = app.clone();
+            let progress_project_id = project_id.clone();
+
+            transcription::transcribe_local(
+                &audio_path.to_string_lossy(),
+                &data_dir.to_string_lossy(),
+                total_duration_sec,
+                move |progress| {
+                    let payload = TranscriptionProgressPayload {
+                        project_id: progress_project_id.clone(),
+                        processed_sec: progress.processed_sec,
+                        total_sec: progress.total_sec,
+                        percentage: progress.percentage,
+                        elapsed_sec: progress.elapsed_sec,
+                        speed: progress.speed,
+                        eta_sec: progress.eta_sec,
+                        using_gpu: progress.using_gpu,
+                    };
+
+                    let _ = app_handle.emit("transcription-progress", payload);
+                },
+            )
+            .await
+            .map_err(to_command_error)?
         }
         other => return Err(format!("Unsupported transcription provider: {other}")),
     };

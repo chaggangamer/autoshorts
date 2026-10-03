@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
-use std::sync::OnceLock;
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
@@ -320,10 +323,46 @@ fn normalize_ffmpeg_whisper_srt(raw: &str) -> Result<NormalizedTranscript> {
     })
 }
 
-pub async fn transcribe_local(
+#[derive(Clone, Debug)]
+pub struct LocalTranscriptionProgress {
+    pub processed_sec: f64,
+    pub total_sec: f64,
+    pub percentage: f64,
+    pub elapsed_sec: f64,
+    pub speed: f64,
+    pub eta_sec: Option<f64>,
+    pub using_gpu: bool,
+}
+
+fn parse_ffmpeg_progress_seconds(line: &str) -> Option<f64> {
+    if let Some(value) = line.strip_prefix("out_time_us=") {
+        return value
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(|value| (value.max(0) as f64) / 1_000_000.0);
+    }
+
+    if let Some(value) = line.strip_prefix("out_time=") {
+        let mut parts = value.trim().split(':');
+        let hours = parts.next()?.parse::<f64>().ok()?;
+        let minutes = parts.next()?.parse::<f64>().ok()?;
+        let seconds = parts.next()?.parse::<f64>().ok()?;
+        return Some((hours * 3600.0 + minutes * 60.0 + seconds).max(0.0));
+    }
+
+    None
+}
+
+pub async fn transcribe_local<F>(
     audio_path: &str,
     data_dir: &str,
-) -> Result<NormalizedTranscript> {
+    total_duration_sec: f64,
+    progress: F,
+) -> Result<NormalizedTranscript>
+where
+    F: Fn(LocalTranscriptionProgress) + Send + Sync + 'static,
+{
     if !ffmpeg_whisper_exists() {
         return Err(anyhow!(
             "Your FFmpeg build does not include the whisper filter. Install an FFmpeg build compiled with --enable-whisper."
@@ -349,14 +388,17 @@ pub async fn transcribe_local(
 
     let output_name = format!("autoshorts-whisper-{}.srt", uuid::Uuid::new_v4());
     let output_path = model_dir.join(&output_name);
+    let progress = Arc::new(progress);
 
     let run_whisper = |use_gpu: bool| {
         let audio_path_owned = audio_path.to_string();
         let model_dir_for_command = model_dir.clone();
         let model_name = model_name.clone();
         let output_name = output_name.clone();
+        let progress = Arc::clone(&progress);
+        let total_duration_sec = total_duration_sec.max(0.0);
 
-        tokio::task::spawn_blocking(move || -> Result<std::process::Output> {
+        tokio::task::spawn_blocking(move || -> Result<(std::process::ExitStatus, String)> {
             let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
             let filter = format!(
                 "whisper=model={}:language=lock:queue=20:use_gpu={}:destination={}:format=srt",
@@ -365,44 +407,152 @@ pub async fn transcribe_local(
                 output_name
             );
 
-            std::process::Command::new("ffmpeg")
+            let mut child = Command::new("ffmpeg")
                 .current_dir(&model_dir_for_command)
                 .arg("-hide_banner")
                 .arg("-loglevel")
-                .arg("warning")
+                .arg("error")
+                .arg("-nostats")
                 .arg("-y")
                 .arg("-i")
                 .arg(&audio_path_owned)
                 .arg("-vn")
                 .arg("-af")
                 .arg(&filter)
+                .arg("-progress")
+                .arg("pipe:1")
                 .arg("-f")
                 .arg("null")
                 .arg(null_sink)
-                .output()
-                .context("executing FFmpeg Whisper filter")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("starting FFmpeg Whisper filter")?;
+
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("Could not capture FFmpeg progress output"))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| anyhow!("Could not capture FFmpeg error output"))?;
+
+            let stderr_thread = std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = BufReader::new(stderr).read_to_string(&mut text);
+                text
+            });
+
+            let started = Instant::now();
+
+            progress(LocalTranscriptionProgress {
+                processed_sec: 0.0,
+                total_sec: total_duration_sec,
+                percentage: 0.0,
+                elapsed_sec: 0.0,
+                speed: 0.0,
+                eta_sec: None,
+                using_gpu: use_gpu,
+            });
+
+            let mut last_processed = 0.0_f64;
+
+            for line in BufReader::new(stdout).lines() {
+                let line = line.context("reading FFmpeg Whisper progress")?;
+                let Some(processed) = parse_ffmpeg_progress_seconds(&line) else {
+                    continue;
+                };
+
+                let processed = if total_duration_sec > 0.0 {
+                    processed.min(total_duration_sec)
+                } else {
+                    processed
+                };
+
+                if processed + 0.001 < last_processed {
+                    continue;
+                }
+
+                last_processed = processed;
+
+                let elapsed = started.elapsed().as_secs_f64();
+                let speed = if elapsed > 0.0 {
+                    processed / elapsed
+                } else {
+                    0.0
+                };
+
+                let percentage = if total_duration_sec > 0.0 {
+                    ((processed / total_duration_sec) * 100.0).clamp(0.0, 100.0)
+                } else {
+                    0.0
+                };
+
+                let eta_sec = if total_duration_sec > processed && speed > 0.01 {
+                    Some((total_duration_sec - processed) / speed)
+                } else {
+                    None
+                };
+
+                progress(LocalTranscriptionProgress {
+                    processed_sec: processed,
+                    total_sec: total_duration_sec,
+                    percentage,
+                    elapsed_sec: elapsed,
+                    speed,
+                    eta_sec,
+                    using_gpu: use_gpu,
+                });
+            }
+
+            let status = child.wait().context("waiting for FFmpeg Whisper")?;
+
+            let stderr = stderr_thread
+                .join()
+                .unwrap_or_else(|_| "FFmpeg stderr reader failed".to_string());
+
+            if status.success() && total_duration_sec > 0.0 {
+                let elapsed = started.elapsed().as_secs_f64();
+                let speed = if elapsed > 0.0 {
+                    total_duration_sec / elapsed
+                } else {
+                    0.0
+                };
+
+                progress(LocalTranscriptionProgress {
+                    processed_sec: total_duration_sec,
+                    total_sec: total_duration_sec,
+                    percentage: 100.0,
+                    elapsed_sec: elapsed,
+                    speed,
+                    eta_sec: Some(0.0),
+                    using_gpu: use_gpu,
+                });
+            }
+
+            Ok((status, stderr))
         })
     };
 
-    let mut output = run_whisper(true)
+    let (mut status, mut stderr) = run_whisper(true)
         .await
         .context("FFmpeg Whisper GPU worker failed")??;
 
-    if !output.status.success() {
-        output = run_whisper(false)
+    if !status.success() {
+        let _ = tokio::fs::remove_file(&output_path).await;
+
+        (status, stderr) = run_whisper(false)
             .await
             .context("FFmpeg Whisper CPU fallback worker failed")??;
     }
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    if !status.success() {
         let _ = tokio::fs::remove_file(&output_path).await;
 
         return Err(anyhow!(
-            "FFmpeg Whisper failed.\nStderr: {}\nStdout: {}",
-            stderr,
-            stdout
+            "FFmpeg Whisper failed.\nStderr: {}",
+            stderr
         ));
     }
 

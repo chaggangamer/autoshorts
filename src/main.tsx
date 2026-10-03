@@ -115,6 +115,17 @@ type BusyState =
   | "clipCount"
   | "cut";
 
+type TranscriptionProgress = {
+  projectId: string;
+  processedSec: number;
+  totalSec: number;
+  percentage: number;
+  elapsedSec: number;
+  speed: number;
+  etaSec: number | null;
+  usingGpu: boolean;
+};
+
 function App() {
   const [environment, setEnvironment] = useState<EnvironmentStatus | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -174,6 +185,7 @@ function App() {
   const [downloadingModelName, setDownloadingModelName] = useState<string | null>(null);
   const [modelDownloadStatus, setModelDownloadStatus] = useState("");
   const [modelDownloadProgress, setModelDownloadProgress] = useState(0);
+  const [transcriptionProgress, setTranscriptionProgress] = useState<TranscriptionProgress | null>(null);
 
   const transcript = useMemo(() => {
     if (!detail?.transcript) return null;
@@ -224,6 +236,24 @@ function App() {
               : llmEngine === "groq"
                 ? canUseGroq
                 : false;
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    void listen<TranscriptionProgress>("transcription-progress", (event) => {
+      const payload = event.payload;
+
+      if (!detail?.project.id || payload.projectId === detail.project.id) {
+        setTranscriptionProgress(payload);
+      }
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [detail?.project.id]);
 
   useEffect(() => {
     void refresh();
@@ -422,7 +452,7 @@ function App() {
 
     if (transcriptionEngine === "local") {
       if (!env.hasLocalWhisperModel) {
-        setError("Import successful. Local Whisper GGML model (ggml-base.bin) is missing in your models directory. Please add it to start transcription.");
+        setError("Import successful. Local Whisper is unavailable because this FFmpeg build does not expose the whisper filter.");
         return;
       }
     } else {
@@ -468,6 +498,7 @@ function App() {
 
     // 1. Transcription
     try {
+      setTranscriptionProgress(null);
       setBusy("transcribe");
       await invoke<Transcript>("transcribe_project", {
         projectId,
@@ -558,6 +589,8 @@ function App() {
 
   async function transcribe() {
     if (!detail) return;
+    setTranscriptionProgress(null);
+
     await run("transcribe", async () => {
       await invoke<Transcript>("transcribe_project", {
         projectId: detail.project.id,
@@ -950,10 +983,78 @@ function App() {
                     </div>
                   </div>
 
+                  {busy === "transcribe" && transcriptionEngine === "local" && (
+                    <div style={{
+                      margin: "0 0 14px",
+                      padding: "14px",
+                      border: "1px solid var(--border)",
+                      borderRadius: "10px",
+                      background: "rgba(255,255,255,0.025)",
+                    }}>
+                      <div style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        gap: "12px",
+                        marginBottom: "9px",
+                      }}>
+                        <strong>Transcribing...</strong>
+                        <span>{Math.round(transcriptionProgress?.percentage ?? 0)}%</span>
+                      </div>
+
+                      <div style={{
+                        height: "8px",
+                        overflow: "hidden",
+                        borderRadius: "999px",
+                        background: "rgba(255,255,255,0.09)",
+                        marginBottom: "10px",
+                      }}>
+                        <div style={{
+                          height: "100%",
+                          width: `${Math.max(1, transcriptionProgress?.percentage ?? 0)}%`,
+                          borderRadius: "inherit",
+                          background: "var(--accent-primary)",
+                          transition: "width 350ms ease",
+                        }} />
+                      </div>
+
+                      {transcriptionProgress ? (
+                        <div style={{
+                          display: "grid",
+                          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                          gap: "6px 16px",
+                          fontSize: "0.82rem",
+                          opacity: 0.82,
+                        }}>
+                          <span>
+                            Processed: {formatDurationLong(transcriptionProgress.processedSec)}
+                            {" / "}
+                            {formatDurationLong(transcriptionProgress.totalSec)}
+                          </span>
+                          <span>Elapsed: {formatDurationLong(transcriptionProgress.elapsedSec)}</span>
+                          <span>
+                            Speed: {transcriptionProgress.speed > 0
+                              ? `${transcriptionProgress.speed.toFixed(1)}x realtime`
+                              : "Calculating..."}
+                          </span>
+                          <span>
+                            Estimated remaining: {transcriptionProgress.etaSec != null
+                              ? `~${formatDurationLong(transcriptionProgress.etaSec)}`
+                              : "Calculating..."}
+                          </span>
+                          <span>Mode: {transcriptionProgress.usingGpu ? "GPU" : "CPU fallback"}</span>
+                        </div>
+                      ) : (
+                        <div style={{ fontSize: "0.82rem", opacity: 0.75 }}>
+                          Starting Local Whisper and waiting for the first progress update...
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   {!canTranscribe && (
                     <div className="api-warning">
                       {transcriptionEngine === "local"
-                        ? `⚠️ Local Whisper (Python package 'openai-whisper') is not installed. Run 'pip3 install openai-whisper' in your terminal.`
+                        ? "⚠️ Local Whisper requires an FFmpeg build with the whisper filter enabled."
                         : "⚠️ Deepgram API Key is missing. Transcribing will not work. Please add your key in API Settings."}
                     </div>
                   )}
@@ -1386,6 +1487,25 @@ function formatTime(seconds: number) {
   const minutes = Math.floor(seconds / 60);
   const remaining = Math.floor(seconds % 60);
   return `${minutes}:${remaining.toString().padStart(2, "0")}`;
+}
+
+function formatDurationLong(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0s";
+
+  const total = Math.floor(seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes.toString().padStart(2, "0")}m ${secs.toString().padStart(2, "0")}s`;
+  }
+
+  if (minutes > 0) {
+    return `${minutes}m ${secs.toString().padStart(2, "0")}s`;
+  }
+
+  return `${secs}s`;
 }
 
 interface OnboardingProps {
