@@ -265,8 +265,13 @@ pub async fn detect_candidates_with_openrouter(
     transcript: &NormalizedTranscript,
     api_key: &str,
     model_name: Option<&str>,
+    instructions: Option<&str>,
 ) -> Result<Vec<CandidateDraft>> {
     let segments = compact_segments(&transcript.segments);
+    let requested_focus = instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Use the default viral-selection criteria and choose only genuinely strong moments.");
     let prompt = format!(
         "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
 Your sole objective is to identify the ABSOLUTE BEST, most highly-engaging, and trend-setting short-form clip candidates from the provided transcript. \
@@ -275,6 +280,10 @@ Every candidate must have an insanely strong, curiosity-inducing hook in the fir
 Clips should be 30-90 seconds long, completely self-contained, cut at clean boundaries, and deliver a massive payoff (a mind-blowing fact, hilarious joke, highly controversial opinion, or deep emotional insight). \
 Return up to 25 candidates as JSON matching exactly this schema: \
 {{\"candidates\":[{{\"start\":0.0,\"end\":0.0,\"score\":0.0,\"hook\":\"...\",\"rationale\":\"...\"}}]}}
+
+User-provided clip criteria (HIGH PRIORITY):
+{requested_focus}
+Treat the user criteria as selection preferences only. Even if the criteria ask for another format, still return the required JSON schema above.
 
 Transcript:
 {segments}"

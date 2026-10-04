@@ -264,7 +264,6 @@ impl Database {
             params![project_id],
         )?;
 
-        let selected_cutoff = drafts.len().min(6).max(3).min(drafts.len());
         let mut candidates = Vec::with_capacity(drafts.len());
 
         for (index, draft) in drafts.iter().enumerate() {
@@ -277,7 +276,7 @@ impl Database {
                 hook: draft.hook.clone(),
                 rationale: draft.rationale.clone(),
                 rank: (index + 1) as i64,
-                selected: index < selected_cutoff,
+                selected: false,
             };
 
             conn.execute(
@@ -358,6 +357,47 @@ impl Database {
             },
         )
         .map_err(Into::into)
+    }
+
+    pub fn set_candidate_selected(
+        &self,
+        candidate_id: &str,
+        selected: bool,
+    ) -> Result<Candidate> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "UPDATE candidates SET selected = ?1 WHERE id = ?2",
+            params![if selected { 1 } else { 0 }, candidate_id],
+        )?;
+        drop(conn);
+        self.get_candidate_with_project(candidate_id)
+            .map(|(candidate, _)| candidate)
+    }
+
+    pub fn update_candidate_timing(
+        &self,
+        candidate_id: &str,
+        start_sec: f64,
+        end_sec: f64,
+    ) -> Result<Candidate> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "UPDATE candidates SET start_sec = ?1, end_sec = ?2 WHERE id = ?3",
+            params![start_sec, end_sec, candidate_id],
+        )?;
+        conn.execute(
+            "UPDATE clips
+             SET status = 'pending',
+                 output_path = NULL,
+                 face_track_json = NULL,
+                 caption_ass_path = NULL,
+                 render_log = NULL
+             WHERE candidate_id = ?1",
+            params![candidate_id],
+        )?;
+        drop(conn);
+        self.get_candidate_with_project(candidate_id)
+            .map(|(candidate, _)| candidate)
     }
 
     pub fn update_clip_for_candidate(

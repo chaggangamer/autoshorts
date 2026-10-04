@@ -306,6 +306,25 @@ fn create_project_from_path(
 
 #[tauri::command]
 fn list_projects(state: tauri::State<'_, AppState>) -> Result<Vec<Project>, String> {
+    let projects = state.db.list_projects().map_err(to_command_error)?;
+
+    for project in &projects {
+        if let Ok(probe) = media::probe_media(&project.source_path) {
+            if let Some(duration) = probe.duration_sec {
+                let needs_refresh = project
+                    .source_duration
+                    .map(|stored| (stored - duration).abs() > 1.0)
+                    .unwrap_or(true);
+
+                if needs_refresh {
+                    let _ = state
+                        .db
+                        .update_project_status(&project.id, &project.status, Some(duration));
+                }
+            }
+        }
+    }
+
     state.db.list_projects().map_err(to_command_error)
 }
 
@@ -436,7 +455,7 @@ async fn transcribe_project(
             Some(&transcript.language),
         )
         .map_err(to_command_error)?;
-    db.update_project_status(&project_id, "analyzing", Some(transcript.duration))
+    db.update_project_status(&project_id, "transcribed", None)
         .map_err(to_command_error)?;
     Ok(saved)
 }
@@ -454,7 +473,7 @@ fn save_demo_transcript(
         .map_err(to_command_error)?;
     state
         .db
-        .update_project_status(&project_id, "analyzing", Some(transcript.duration))
+        .update_project_status(&project_id, "transcribed", None)
         .map_err(to_command_error)?;
     Ok(saved)
 }
@@ -466,6 +485,7 @@ async fn generate_candidates(
     api_key: Option<String>,
     provider: Option<String>,
     model_name: Option<String>,
+    instructions: Option<String>,
     _allow_demo: bool,
 ) -> Result<Vec<Candidate>, String> {
     let db = state.db.clone();
@@ -518,7 +538,12 @@ async fn generate_candidates(
             let key = api_key
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
                 .ok_or_else(|| "Set OPENROUTER_API_KEY or supply OpenRouter API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_openrouter(&normalized, &key, model_name.as_deref())
+            llm::detect_candidates_with_openrouter(
+                &normalized,
+                &key,
+                model_name.as_deref(),
+                instructions.as_deref(),
+            )
                 .await
                 .map_err(to_command_error)?
         }
@@ -561,6 +586,50 @@ fn set_selected_clip_count(
     state
         .db
         .set_selected_clip_count(&project_id, count.clamp(0, 10))
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
+fn set_candidate_selected(
+    state: tauri::State<'_, AppState>,
+    candidate_id: String,
+    selected: bool,
+) -> Result<Candidate, String> {
+    state
+        .db
+        .set_candidate_selected(&candidate_id, selected)
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
+fn update_candidate_timing(
+    state: tauri::State<'_, AppState>,
+    candidate_id: String,
+    start_sec: f64,
+    end_sec: f64,
+) -> Result<Candidate, String> {
+    if !start_sec.is_finite() || !end_sec.is_finite() {
+        return Err("Candidate timestamps must be finite numbers.".to_string());
+    }
+
+    let (_, project) = state
+        .db
+        .get_candidate_with_project(&candidate_id)
+        .map_err(to_command_error)?;
+
+    let start_sec = start_sec.max(0.0);
+    let end_sec = match project.source_duration {
+        Some(duration) if duration.is_finite() && duration > 0.0 => end_sec.min(duration),
+        _ => end_sec,
+    };
+
+    if end_sec <= start_sec {
+        return Err("Candidate end time must be after its start time.".to_string());
+    }
+
+    state
+        .db
+        .update_candidate_timing(&candidate_id, start_sec, end_sec)
         .map_err(to_command_error)
 }
 
@@ -725,6 +794,8 @@ pub fn run() {
             save_demo_transcript,
             generate_candidates,
             set_selected_clip_count,
+            set_candidate_selected,
+            update_candidate_timing,
             render_flat_clip_for_candidate,
             delete_project,
             rename_project,

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -186,6 +186,11 @@ function App() {
   const [modelDownloadStatus, setModelDownloadStatus] = useState("");
   const [modelDownloadProgress, setModelDownloadProgress] = useState(0);
   const [transcriptionProgress, setTranscriptionProgress] = useState<TranscriptionProgress | null>(null);
+  const [momentInstructions, setMomentInstructions] = useState(() =>
+    localStorage.getItem("autoshorts_moment_instructions") ||
+    "Find the strongest viral moments. Prioritize funny reactions, rage, arguments, unexpected moments, clutch gameplay, strong opinions and clear payoffs. Avoid boring normal gameplay and context-heavy clips."
+  );
+  const [previewCandidateId, setPreviewCandidateId] = useState<string | null>(null);
 
   const transcript = useMemo(() => {
     if (!detail?.transcript) return null;
@@ -195,6 +200,11 @@ function App() {
       return null;
     }
   }, [detail?.transcript]);
+
+  const previewCandidate = useMemo(
+    () => detail?.candidates.find((candidate) => candidate.id === previewCandidateId) ?? null,
+    [detail?.candidates, previewCandidateId],
+  );
 
   const selectedCount = detail?.candidates.filter((candidate) => candidate.selected).length ?? 0;
   const clipByCandidate = useMemo(() => {
@@ -322,6 +332,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem("autoshorts_openrouter_model", openrouterModel);
   }, [openrouterModel]);
+
+  useEffect(() => {
+    localStorage.setItem("autoshorts_moment_instructions", momentInstructions);
+  }, [momentInstructions]);
 
   const pullModelDirectly = async (modelName: string) => {
     setDownloadingModelName(modelName);
@@ -463,40 +477,6 @@ function App() {
       }
     }
 
-    if (llmEngine === "local") {
-      if (!env.hasOllama) {
-        setError("Import successful. Local Ollama server is not running at http://localhost:11434. Please start it to find viral moments.");
-        return;
-      }
-    } else {
-      const activeKey =
-        llmEngine === "claude" ? anthropicKey :
-          llmEngine === "deepseek" ? deepseekKey :
-            llmEngine === "gemini" ? geminiKey :
-              llmEngine === "openai" ? openaiKey :
-                llmEngine === "openrouter" ? openrouterKey :
-                  llmEngine === "groq" ? groqKey : "";
-      const hasActiveKey =
-        llmEngine === "claude" ? (env.hasAnthropicKey || activeKey.trim().length > 0) :
-          llmEngine === "deepseek" ? (env.hasDeepseekKey || activeKey.trim().length > 0) :
-            llmEngine === "gemini" ? (env.hasGeminiKey || activeKey.trim().length > 0) :
-              llmEngine === "openai" ? (env.hasOpenaiKey || activeKey.trim().length > 0) :
-                llmEngine === "openrouter" ? (env.hasOpenrouterKey || activeKey.trim().length > 0) :
-                  llmEngine === "groq" ? (env.hasGroqKey || activeKey.trim().length > 0) : false;
-      if (!hasActiveKey) {
-        const engineName =
-          llmEngine === "claude" ? "Claude" :
-            llmEngine === "deepseek" ? "DeepSeek" :
-              llmEngine === "gemini" ? "Gemini" :
-                llmEngine === "openai" ? "OpenAI" :
-                  llmEngine === "openrouter" ? "OpenRouter" :
-                    llmEngine === "groq" ? "Groq" : "LLM";
-        setError(`Transcription complete. ${engineName} API Key is missing. Please add it in settings to analyze viral moments.`);
-        return;
-      }
-    }
-
-    // 1. Transcription
     try {
       setTranscriptionProgress(null);
       setBusy("transcribe");
@@ -507,41 +487,6 @@ function App() {
       });
       await refresh(projectId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setBusy("idle");
-      return;
-    }
-
-    // 2. LLM Moments
-    try {
-      setBusy("moments");
-      const activeKey =
-        llmEngine === "claude" ? anthropicKey.trim() :
-          llmEngine === "deepseek" ? deepseekKey.trim() :
-            llmEngine === "gemini" ? geminiKey.trim() :
-              llmEngine === "openai" ? openaiKey.trim() :
-                llmEngine === "openrouter" ? openrouterKey.trim() :
-                  llmEngine === "groq" ? groqKey.trim() : "";
-      await invoke<Candidate[]>("generate_candidates", {
-        projectId,
-        apiKey: activeKey || null,
-        provider: llmEngine,
-        modelName: llmEngine === "local" ? localLlmModel.trim() : (llmEngine === "deepseek" ? (deepseekModel.trim() || null) : (llmEngine === "openrouter" ? (openrouterModel.trim() || null) : null)),
-        allowDemo: false,
-      });
-      await refresh(projectId);
-    } catch (err) {
-      const errMsg = String(err);
-      if (llmEngine === "local" && (errMsg.includes("not found") || errMsg.includes("404"))) {
-        if (window.confirm(`Ollama model "${localLlmModel}" is not downloaded. Would you like to download it now?`)) {
-          setTimeout(() => {
-            void pullModelDirectly(localLlmModel).then(() => {
-              void refresh(projectId);
-            });
-          }, 100);
-          return;
-        }
-      }
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy("idle");
@@ -617,6 +562,7 @@ function App() {
           apiKey: activeKey || null,
           provider: llmEngine,
           modelName: llmEngine === "local" ? localLlmModel.trim() : (llmEngine === "deepseek" ? (deepseekModel.trim() || null) : (llmEngine === "openrouter" ? (openrouterModel.trim() || null) : null)),
+          instructions: momentInstructions.trim() || null,
           allowDemo,
         });
         await refresh(detail.project.id);
@@ -635,6 +581,61 @@ function App() {
         throw err;
       }
     });
+  }
+
+  async function setCandidateApproved(candidateId: string, selected: boolean) {
+    if (!detail) return;
+    try {
+      const updated = await invoke<Candidate>("set_candidate_selected", { candidateId, selected });
+      setDetail((current) => current
+        ? { ...current, candidates: current.candidates.map((candidate) => candidate.id === updated.id ? updated : candidate) }
+        : current);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function adjustCandidate(candidate: Candidate, edge: "start" | "end", delta: number) {
+    if (!detail) return;
+
+    const maxDuration = detail.project.sourceDuration ?? transcript?.duration ?? Number.POSITIVE_INFINITY;
+    let startSec = candidate.startSec;
+    let endSec = candidate.endSec;
+
+    if (edge === "start") {
+      startSec = Math.max(0, Math.min(candidate.startSec + delta, endSec - 1));
+    } else {
+      endSec = Math.max(startSec + 1, candidate.endSec + delta);
+      if (Number.isFinite(maxDuration)) {
+        endSec = Math.min(endSec, maxDuration);
+      }
+    }
+
+    try {
+      const updated = await invoke<Candidate>("update_candidate_timing", {
+        candidateId: candidate.id,
+        startSec,
+        endSec,
+      });
+      setDetail((current) => current
+        ? {
+            ...current,
+            candidates: current.candidates.map((item) => item.id === updated.id ? updated : item),
+            clips: current.clips.map((clip) => clip.candidateId === updated.id
+              ? {
+                  ...clip,
+                  status: "pending",
+                  outputPath: null,
+                  faceTrackJson: null,
+                  captionAssPath: null,
+                  renderLog: null,
+                }
+              : clip),
+          }
+        : current);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   async function updateClipCount(count: number) {
@@ -1073,16 +1074,16 @@ function App() {
                   <div className="panel-heading">
                     <div>
                       <h3>Clip Candidates</h3>
-                      <p>{detail.candidates.length ? `${selectedCount} selected` : "No candidates"}</p>
+                      <p>{detail.candidates.length ? `${selectedCount} approved / ${detail.candidates.length} found` : "No candidates yet"}</p>
                     </div>
                     <div className="button-pair">
-                      <button onClick={cutSelected} disabled={busy !== "idle" || selectedCount === 0 || !environment?.hasFfmpeg}>
-                        {busy === "cut" ? <Loader2 className="spin" size={16} /> : <Scissors size={16} />}
-                        Cut
-                      </button>
                       <button onClick={() => void moments(false)} disabled={busy !== "idle" || !detail.transcript || !canUseActiveLlm}>
                         {busy === "moments" ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-                        Find Viral Moments
+                        Find Moments
+                      </button>
+                      <button onClick={cutSelected} disabled={busy !== "idle" || selectedCount === 0 || !environment?.hasFfmpeg}>
+                        {busy === "cut" ? <Loader2 className="spin" size={16} /> : <Scissors size={16} />}
+                        Render Approved
                       </button>
                     </div>
                   </div>
@@ -1101,17 +1102,58 @@ function App() {
                     </div>
                   )}
 
-                  {detail.candidates.length > 0 && (
-                    <div className="clip-control">
-                      <SlidersHorizontal size={17} />
-                      <input
-                        type="range"
-                        min="0"
-                        max={detail.candidates.length}
-                        value={selectedCount}
-                        onChange={(event) => void updateClipCount(Number(event.target.value))}
+                  <div className="moment-instructions-box">
+                    <div className="moment-instructions-heading">
+                      <div>
+                        <strong>AI Instructions</strong>
+                        <span>Tell OpenRouter exactly what kind of moments you want before analysis.</span>
+                      </div>
+                    </div>
+                    <textarea
+                      value={momentInstructions}
+                      onChange={(event) => setMomentInstructions(event.target.value)}
+                      rows={4}
+                      placeholder="Example: Find funny rage, arguments, unexpected reactions and clutch moments. Avoid normal gameplay."
+                      disabled={busy === "moments"}
+                    />
+                    <div className="moment-presets">
+                      <button type="button" onClick={() => setMomentInstructions("Find the strongest viral moments with a hook in the first 3 seconds. Prefer high-energy reactions, surprising turns and clear payoffs. Avoid boring setup.")}>Viral</button>
+                      <button type="button" onClick={() => setMomentInstructions("Find funny moments, rage, arguments, fails and unexpected reactions. Avoid normal gameplay and weak context-heavy moments.")}>Funny / Rage</button>
+                      <button type="button" onClick={() => setMomentInstructions("Find insane gameplay, clutch plays, close fights, smart outplays and strong reactions immediately after them.")}>Clutch</button>
+                      <button type="button" onClick={() => setMomentInstructions("Find controversial statements, strong opinions, debates, arguments and moments likely to trigger comments or discussion.")}>Controversial</button>
+                    </div>
+                  </div>
+
+                  {previewCandidate && (
+                    <div className="candidate-source-preview">
+                      <div className="candidate-source-preview-header">
+                        <div>
+                          <strong>Previewing candidate #{previewCandidate.rank}</strong>
+                          <span>{formatTime(previewCandidate.startSec)} - {formatTime(previewCandidate.endSec)} · original source · nothing rendered yet</span>
+                        </div>
+                        <button type="button" onClick={() => setPreviewCandidateId(null)}>Close</button>
+                      </div>
+                      <video
+                        key={`${detail.project.sourcePath}-${previewCandidate.id}-${previewCandidate.startSec}-${previewCandidate.endSec}`}
+                        className="candidate-source-video"
+                        src={convertFileSrc(detail.project.sourcePath)}
+                        controls
+                        preload="metadata"
+                        onLoadedMetadata={(event) => {
+                          event.currentTarget.currentTime = previewCandidate.startSec;
+                          void event.currentTarget.play().catch(() => undefined);
+                        }}
+                        onPlay={(event) => {
+                          if (event.currentTarget.currentTime < previewCandidate.startSec || event.currentTarget.currentTime >= previewCandidate.endSec) {
+                            event.currentTarget.currentTime = previewCandidate.startSec;
+                          }
+                        }}
+                        onTimeUpdate={(event) => {
+                          if (event.currentTarget.currentTime >= previewCandidate.endSec) {
+                            event.currentTarget.pause();
+                          }
+                        }}
                       />
-                      <strong>{selectedCount}</strong>
                     </div>
                   )}
 
@@ -1119,21 +1161,20 @@ function App() {
                     {detail.candidates.map((candidate) => {
                       const clip = clipByCandidate.get(candidate.id);
                       const isCut = clip?.status === "done" && Boolean(clip.outputPath);
+                      const isPreviewing = previewCandidateId === candidate.id;
                       return (
                         <article key={candidate.id} className={`candidate-card ${candidate.selected ? "selected" : ""}`}>
-                          {/* 9:16 portrait mockup preview placeholder representing vertical formats */}
                           <div className="portrait-preview-container">
-                            <div className="portrait-preview-mock">
-                              {isCut ? (
-                                <div className="mock-video-active">
-                                  <Play size={20} className="play-icon-mock" />
-                                </div>
-                              ) : (
-                                <div className="mock-video-inactive">
-                                  <span>9:16</span>
-                                </div>
-                              )}
-                            </div>
+                            <button
+                              type="button"
+                              className={`portrait-preview-mock preview-trigger ${isPreviewing ? "active" : ""}`}
+                              onClick={() => setPreviewCandidateId(candidate.id)}
+                              title="Preview this moment from the original video"
+                            >
+                              <div className="mock-video-active">
+                                <Play size={20} className="play-icon-mock" />
+                              </div>
+                            </button>
                             <div className="candidate-rank">
                               <span>#{candidate.rank}</span>
                               {candidate.selected && <Check size={14} />}
@@ -1148,23 +1189,32 @@ function App() {
                             <h4>{candidate.hook}</h4>
                             <p className="candidate-rationale">{candidate.rationale}</p>
 
-                            <div className="candidate-actions">
-                              <span className={`clip-status ${isCut ? "ready" : clip?.status === "error" ? "error" : ""}`}>
-                                {isCut ? "Cut ready" : clip?.status === "error" ? "Cut failed" : clip?.status ?? "Pending"}
-                              </span>
-                              <button
-                                className="cut-button"
-                                onClick={() => void cutCandidate(candidate.id)}
-                                disabled={busy !== "idle" || !environment?.hasFfmpeg}
-                              >
-                                {renderingCandidateId === candidate.id ? (
-                                  <Loader2 className="spin" size={14} />
-                                ) : (
-                                  <Scissors size={14} />
-                                )}
-                                {renderingCandidateId === candidate.id ? "Cutting..." : isCut ? "Re-cut" : "Cut"}
-                              </button>
+                            <div className="timing-adjust">
+                              <span>Start</span>
+                              <button type="button" onClick={() => void adjustCandidate(candidate, "start", -5)}>-5s</button>
+                              <button type="button" onClick={() => void adjustCandidate(candidate, "start", 5)}>+5s</button>
+                              <span>End</span>
+                              <button type="button" onClick={() => void adjustCandidate(candidate, "end", -5)}>-5s</button>
+                              <button type="button" onClick={() => void adjustCandidate(candidate, "end", 5)}>+5s</button>
                             </div>
+
+                            <div className="candidate-actions review-actions">
+                              <span className={`clip-status ${isCut ? "ready" : clip?.status === "error" ? "error" : candidate.selected ? "ready" : ""}`}>
+                                {isCut ? "Rendered" : clip?.status === "error" ? "Render failed" : candidate.selected ? "Approved" : "Needs review"}
+                              </span>
+                              <div className="review-button-group">
+                                <button type="button" className={`review-button preview ${isPreviewing ? "active" : ""}`} onClick={() => setPreviewCandidateId(candidate.id)}>
+                                  <Play size={14} /> Preview
+                                </button>
+                                <button type="button" className="review-button approve" onClick={() => void setCandidateApproved(candidate.id, true)} disabled={candidate.selected}>
+                                  <Check size={14} /> {candidate.selected ? "Approved" : "Approve"}
+                                </button>
+                                <button type="button" className="review-button reject" onClick={() => void setCandidateApproved(candidate.id, false)} disabled={!candidate.selected}>
+                                  Reject
+                                </button>
+                              </div>
+                            </div>
+
                             {clip?.outputPath && <div className="output-path">{clip.outputPath}</div>}
                             {clip?.captionAssPath && (
                               <div className="output-path" style={{ background: "rgba(142, 230, 199, 0.05)", borderColor: "var(--accent-primary)", color: "var(--accent-primary)", marginTop: "4px" }}>
@@ -1176,10 +1226,9 @@ function App() {
                         </article>
                       );
                     })}
-                    {detail.candidates.length === 0 && <EmptyState icon={<Sparkles size={28} />} label="Moments pending" />}
+                    {detail.candidates.length === 0 && <EmptyState icon={<Sparkles size={28} />} label={detail.transcript ? "Add AI instructions, then Find Moments" : "Transcribe first"} />}
                   </div>
-                </section>
-              </div>
+                </section>              </div>
             </>
           ) : (
             <div className="home-dashboard">
@@ -1216,7 +1265,7 @@ function App() {
                         </div>
                         <h3 className="project-card-title">{name}</h3>
                         <div className="project-card-meta">
-                          <span>Duration: {project.sourceDuration ? formatTime(project.sourceDuration) : "Probing..."}</span>
+                          <span>Duration: {project.sourceDuration ? formatDurationLong(project.sourceDuration) : "Probing..."}</span>
                           <span>Created: {new Date(project.createdAt).toLocaleDateString()}</span>
                         </div>
                         <div className="project-card-actions">
@@ -1484,8 +1533,16 @@ function fileName(path: string) {
 }
 
 function formatTime(seconds: number) {
-  const minutes = Math.floor(seconds / 60);
-  const remaining = Math.floor(seconds % 60);
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const total = Math.floor(seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remaining = total % 60;
+
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, "0")}:${remaining.toString().padStart(2, "0")}`;
+  }
+
   return `${minutes}:${remaining.toString().padStart(2, "0")}`;
 }
 
