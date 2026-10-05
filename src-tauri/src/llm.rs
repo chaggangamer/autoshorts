@@ -558,6 +558,104 @@ Ensure the 'start' and 'end' values correspond to actual timestamps in the trans
     parse_candidate_json(&res_body.message.content, min_duration)
 }
 
+fn parse_caption_payload_text(raw: &str) -> Result<serde_json::Value> {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Ok(value);
+    }
+
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if end > start {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
+                return Ok(value);
+            }
+        }
+    }
+
+    if let (Some(start), Some(end)) = (trimmed.find('['), trimmed.rfind(']')) {
+        if end > start {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
+                return Ok(value);
+            }
+        }
+    }
+
+    Err(anyhow!("OpenRouter returned caption text that was not valid JSON"))
+}
+
+fn extract_openrouter_caption_payload(body: &str) -> Result<serde_json::Value> {
+    let envelope: serde_json::Value = serde_json::from_str(body)
+        .context("parsing OpenRouter caption response envelope")?;
+
+    let choice = envelope
+        .get("choices")
+        .and_then(|value| value.as_array())
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| anyhow!("OpenRouter caption response did not include a choice"))?;
+
+    let message = choice
+        .get("message")
+        .ok_or_else(|| anyhow!("OpenRouter caption response did not include a message"))?;
+
+    if let Some(arguments) = message.pointer("/tool_calls/0/function/arguments") {
+        if let Some(arguments) = arguments.as_str() {
+            return parse_caption_payload_text(arguments)
+                .context("parsing OpenRouter caption tool arguments");
+        }
+        if arguments.is_object() || arguments.is_array() {
+            return Ok(arguments.clone());
+        }
+    }
+
+    if let Some(content) = message.get("content") {
+        if let Some(text) = content.as_str() {
+            if !text.trim().is_empty() {
+                return parse_caption_payload_text(text)
+                    .context("parsing OpenRouter caption content");
+            }
+        }
+
+        if let Some(parts) = content.as_array() {
+            let mut combined = String::new();
+            for part in parts {
+                if let Some(text) = part.as_str() {
+                    combined.push_str(text);
+                } else if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                    combined.push_str(text);
+                }
+            }
+            if !combined.trim().is_empty() {
+                return parse_caption_payload_text(&combined)
+                    .context("parsing OpenRouter caption content parts");
+            }
+        }
+
+        if content.is_object() {
+            if let Some(text) = content.get("text").and_then(|value| value.as_str()) {
+                if !text.trim().is_empty() {
+                    return parse_caption_payload_text(text)
+                        .context("parsing OpenRouter caption content object");
+                }
+            }
+        }
+    }
+
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+
+    Err(anyhow!(
+        "OpenRouter returned no usable caption payload (finish reason: {finish_reason})"
+    ))
+}
+
 pub async fn rewrite_caption_lines_with_openrouter(
     lines: &[String],
     target_language: &str,
@@ -593,8 +691,7 @@ pub async fn rewrite_caption_lines_with_openrouter(
 {target_rule} \
 Keep captions short enough for vertical short-form video. Do not add facts, commentary, emojis, labels, censorship, or explanations. \
 CRITICAL: preserve the exact number of caption items and their indexes. Never merge, split, drop, or reorder items. \
-Return ONLY valid JSON in exactly this shape: \
-{{\"captions\":[{{\"index\":0,\"text\":\"...\"}}]}}\n\n\
+Return the result through the return_captions tool exactly once.\n\n\
 Source captions:\n{indexed_json}"
     );
 
@@ -616,7 +713,41 @@ Source captions:\n{indexed_json}"
                     "content": prompt,
                 }
             ],
-            "temperature": 0.1
+            "temperature": 0.1,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "return_captions",
+                        "description": "Return all localized caption items with their original indexes.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "captions": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "index": { "type": "integer" },
+                                            "text": { "type": "string" }
+                                        },
+                                        "required": ["index", "text"],
+                                        "additionalProperties": false
+                                    }
+                                }
+                            },
+                            "required": ["captions"],
+                            "additionalProperties": false
+                        }
+                    }
+                }
+            ],
+            "tool_choice": {
+                "type": "function",
+                "function": {
+                    "name": "return_captions"
+                }
+            }
         }))
         .send()
         .await
@@ -628,26 +759,13 @@ Source captions:\n{indexed_json}"
         return Err(anyhow!("OpenRouter caption request failed ({status}): {body}"));
     }
 
-    let res_body: ChatCompletionResponse = response
-        .json()
+    let body = response
+        .text()
         .await
-        .context("parsing OpenRouter caption response")?;
-    let raw = res_body
-        .choices
-        .first()
-        .map(|choice| choice.message.content.clone())
-        .ok_or_else(|| anyhow!("OpenRouter caption response did not include choices content"))?;
+        .context("reading OpenRouter caption response")?;
+    let value = extract_openrouter_caption_payload(&body)?;
 
-    let trimmed = raw
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-
-    let value: serde_json::Value =
-        serde_json::from_str(trimmed).context("parsing caption JSON")?;
-    let items = if let Some(items) = value.get("captions").and_then(|v| v.as_array()) {
+    let items = if let Some(items) = value.get("captions").and_then(|value| value.as_array()) {
         items.clone()
     } else if let Some(items) = value.as_array() {
         items.clone()
@@ -657,10 +775,10 @@ Source captions:\n{indexed_json}"
 
     let mut output = vec![None::<String>; lines.len()];
     for item in items {
-        let Some(index) = item.get("index").and_then(|v| v.as_u64()) else {
+        let Some(index) = item.get("index").and_then(|value| value.as_u64()) else {
             continue;
         };
-        let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
+        let Some(text) = item.get("text").and_then(|value| value.as_str()) else {
             continue;
         };
 
