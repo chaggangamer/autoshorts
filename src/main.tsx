@@ -105,6 +105,12 @@ type NormalizedTranscript = {
     speaker: string | null;
     text: string;
   }>;
+  words?: Array<{
+    text: string;
+    start: number;
+    end: number;
+    speaker?: string | null;
+  }>;
 };
 
 type BusyState =
@@ -195,6 +201,7 @@ function App() {
     "Find the strongest viral moments. Prioritize funny reactions, rage, arguments, unexpected moments, clutch gameplay, strong opinions and clear payoffs. Avoid boring normal gameplay and context-heavy clips."
   );
   const [previewCandidateId, setPreviewCandidateId] = useState<string | null>(null);
+  const [previewTime, setPreviewTime] = useState(0);
 
   const transcript = useMemo(() => {
     if (!detail?.transcript) return null;
@@ -214,6 +221,38 @@ function App() {
   const clipByCandidate = useMemo(() => {
     return new Map(detail?.clips.map((clip) => [clip.candidateId, clip]) ?? []);
   }, [detail?.clips]);
+  const previewClip = previewCandidate ? clipByCandidate.get(previewCandidate.id) ?? null : null;
+  const previewIsRendered = previewClip?.status === "done" && Boolean(previewClip.outputPath);
+
+  const previewCaptionText = useMemo(() => {
+    if (!previewCandidate || previewIsRendered || !transcript) return "";
+
+    const words = transcript.words ?? [];
+    if (words.length > 0) {
+      const activeIndex = words.findIndex((word) => word.end > previewTime && word.start <= previewTime);
+      if (activeIndex >= 0) {
+        const chunkStart = Math.floor(activeIndex / 2) * 2;
+        return words
+          .slice(chunkStart, chunkStart + 2)
+          .filter((word) => word.end > previewCandidate.startSec && word.start < previewCandidate.endSec)
+          .map((word) => word.text)
+          .join(" ")
+          .toUpperCase();
+      }
+    }
+
+    const segment = transcript.segments.find(
+      (item) => item.end > previewTime && item.start <= previewTime
+    );
+    if (!segment) return "";
+
+    return segment.text
+      .trim()
+      .split(/\s+/)
+      .slice(0, 5)
+      .join(" ")
+      .toUpperCase();
+  }, [previewCandidate, previewIsRendered, previewTime, transcript]);
   const selectedCandidates = detail?.candidates.filter((candidate) => candidate.selected) ?? [];
   const selectedCutCount = selectedCandidates.filter((candidate) => {
     const clip = clipByCandidate.get(candidate.id);
@@ -1233,32 +1272,77 @@ function App() {
                     <div className="candidate-source-preview">
                       <div className="candidate-source-preview-header">
                         <div>
-                          <strong>Previewing candidate #{previewCandidate.rank}</strong>
-                          <span>{formatTime(previewCandidate.startSec)} - {formatTime(previewCandidate.endSec)} · original source · nothing rendered yet</span>
+                          <strong>
+                            {previewIsRendered
+                              ? `Final rendered clip #${previewCandidate.rank}`
+                              : `Previewing candidate #${previewCandidate.rank}`}
+                          </strong>
+                          <span>
+                            {previewIsRendered
+                              ? `captions burned in · ${detail.project.captionLanguage ?? "original"} · ${detail.project.captionStyle ?? "modern-box"}`
+                              : `${formatTime(previewCandidate.startSec)} - ${formatTime(previewCandidate.endSec)} · live caption-style preview`}
+                          </span>
                         </div>
                         <button type="button" onClick={() => setPreviewCandidateId(null)}>Close</button>
                       </div>
-                      <video
-                        key={`${detail.project.sourcePath}-${previewCandidate.id}-${previewCandidate.startSec}-${previewCandidate.endSec}`}
-                        className="candidate-source-video"
-                        src={convertFileSrc(detail.project.sourcePath)}
-                        controls
-                        preload="metadata"
-                        onLoadedMetadata={(event) => {
-                          event.currentTarget.currentTime = previewCandidate.startSec;
-                          void event.currentTarget.play().catch(() => undefined);
-                        }}
-                        onPlay={(event) => {
-                          if (event.currentTarget.currentTime < previewCandidate.startSec || event.currentTarget.currentTime >= previewCandidate.endSec) {
-                            event.currentTarget.currentTime = previewCandidate.startSec;
-                          }
-                        }}
-                        onTimeUpdate={(event) => {
-                          if (event.currentTarget.currentTime >= previewCandidate.endSec) {
-                            event.currentTarget.pause();
-                          }
-                        }}
-                      />
+
+                      <div className="candidate-video-stage">
+                        <video
+                          key={`${previewIsRendered ? previewClip?.outputPath : detail.project.sourcePath}-${previewCandidate.id}-${previewCandidate.startSec}-${previewCandidate.endSec}`}
+                          className="candidate-source-video"
+                          src={convertFileSrc(
+                            previewIsRendered && previewClip?.outputPath
+                              ? previewClip.outputPath
+                              : detail.project.sourcePath
+                          )}
+                          controls
+                          preload="metadata"
+                          onLoadedMetadata={(event) => {
+                            if (previewIsRendered) {
+                              event.currentTarget.currentTime = 0;
+                              setPreviewTime(previewCandidate.startSec);
+                            } else {
+                              event.currentTarget.currentTime = previewCandidate.startSec;
+                              setPreviewTime(previewCandidate.startSec);
+                            }
+                            void event.currentTarget.play().catch(() => undefined);
+                          }}
+                          onPlay={(event) => {
+                            if (
+                              !previewIsRendered &&
+                              (event.currentTarget.currentTime < previewCandidate.startSec ||
+                                event.currentTarget.currentTime >= previewCandidate.endSec)
+                            ) {
+                              event.currentTarget.currentTime = previewCandidate.startSec;
+                            }
+                          }}
+                          onTimeUpdate={(event) => {
+                            if (previewIsRendered) return;
+                            setPreviewTime(event.currentTarget.currentTime);
+                            if (event.currentTarget.currentTime >= previewCandidate.endSec) {
+                              event.currentTarget.pause();
+                            }
+                          }}
+                        />
+
+                        {!previewIsRendered && previewCaptionText && (
+                          <div className={`live-caption-preview caption-${detail.project.captionStyle ?? "modern-box"}`}>
+                            {previewCaptionText}
+                          </div>
+                        )}
+                      </div>
+
+                      {!previewIsRendered && (detail.project.captionLanguage ?? "original") !== "original" && (
+                        <div className="preview-caption-note">
+                          Style/placement is previewed live. The exact {detail.project.captionLanguage} wording is generated by OpenRouter during render; after rendering, Preview plays the exact final clip with burned captions.
+                        </div>
+                      )}
+
+                      {previewIsRendered && previewClip?.outputPath && (
+                        <div className="output-path">
+                          Final clip: {previewClip.outputPath}
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -1309,7 +1393,7 @@ function App() {
                               </span>
                               <div className="review-button-group">
                                 <button type="button" className={`review-button preview ${isPreviewing ? "active" : ""}`} onClick={() => setPreviewCandidateId(candidate.id)}>
-                                  <Play size={14} /> Preview
+                                  <Play size={14} /> {isCut ? "Preview Final" : "Preview"}
                                 </button>
                                 <button type="button" className="review-button approve" onClick={() => void setCandidateApproved(candidate.id, true)} disabled={candidate.selected}>
                                   <Check size={14} /> {candidate.selected ? "Approved" : "Approve"}
