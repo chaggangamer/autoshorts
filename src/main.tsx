@@ -52,6 +52,7 @@ type Project = {
   status: string;
   transcriptionMode: string;
   captionStyle?: string | null;
+  captionLanguage?: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -136,6 +137,9 @@ function App() {
   const [renderingCandidateId, setRenderingCandidateId] = useState<string | null>(null);
   const [showStyleModal, setShowStyleModal] = useState(false);
   const [selectedStyle, setSelectedStyle] = useState("modern-box");
+  const [selectedCaptionLanguage, setSelectedCaptionLanguage] = useState(() =>
+    localStorage.getItem("autoshorts_caption_language") || "hinglish"
+  );
   const [mediaPathToImport, setMediaPathToImport] = useState<string | null>(null);
 
   const [youtubeModalOpen, setYoutubeModalOpen] = useState(false);
@@ -337,6 +341,10 @@ function App() {
     localStorage.setItem("autoshorts_moment_instructions", momentInstructions);
   }, [momentInstructions]);
 
+  useEffect(() => {
+    localStorage.setItem("autoshorts_caption_language", selectedCaptionLanguage);
+  }, [selectedCaptionLanguage]);
+
   const pullModelDirectly = async (modelName: string) => {
     setDownloadingModelName(modelName);
     setModelDownloadProgress(0);
@@ -438,7 +446,7 @@ function App() {
     }
   }
 
-  async function confirmImport(style: string) {
+  async function confirmImport(style: string, captionLanguage: string) {
     if (!mediaPathToImport) return;
     const selected = mediaPathToImport;
     setMediaPathToImport(null);
@@ -450,6 +458,7 @@ function App() {
         path: selected,
         transcriptionMode: transcriptionEngine === "local" ? "local" : "cloud",
         captionStyle: style,
+        captionLanguage,
       });
       newProjectId = project.id;
       await refresh(project.id);
@@ -583,6 +592,35 @@ function App() {
     });
   }
 
+  async function updateProjectCaptionSettings(captionStyle: string, captionLanguage: string) {
+    if (!detail) return;
+
+    try {
+      const project = await invoke<Project>("update_project_caption_settings", {
+        projectId: detail.project.id,
+        captionStyle,
+        captionLanguage,
+      });
+
+      setDetail((current) => current
+        ? {
+            ...current,
+            project,
+            clips: current.clips.map((clip) => ({
+              ...clip,
+              status: "pending",
+              outputPath: null,
+              faceTrackJson: null,
+              captionAssPath: null,
+              renderLog: null,
+            })),
+          }
+        : current);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function setCandidateApproved(candidateId: string, selected: boolean) {
     if (!detail) return;
     try {
@@ -655,7 +693,11 @@ function App() {
     setBusy("cut");
     setError(null);
     try {
-      await invoke<string>("render_flat_clip_for_candidate", { candidateId });
+      await invoke<string>("render_flat_clip_for_candidate", {
+        candidateId,
+        captionApiKey: openrouterKey.trim() || null,
+        captionModelName: openrouterModel.trim() || null,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -672,7 +714,11 @@ function App() {
     try {
       for (const candidate of selectedCandidates) {
         setRenderingCandidateId(candidate.id);
-        await invoke<string>("render_flat_clip_for_candidate", { candidateId: candidate.id });
+        await invoke<string>("render_flat_clip_for_candidate", {
+          candidateId: candidate.id,
+          captionApiKey: openrouterKey.trim() || null,
+          captionModelName: openrouterModel.trim() || null,
+        });
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -1081,13 +1127,72 @@ function App() {
                         {busy === "moments" ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
                         Find Moments
                       </button>
-                      <button onClick={cutSelected} disabled={busy !== "idle" || selectedCount === 0 || !environment?.hasFfmpeg}>
+                      <button
+                        onClick={cutSelected}
+                        disabled={
+                          busy !== "idle" ||
+                          selectedCount === 0 ||
+                          !environment?.hasFfmpeg ||
+                          ((detail.project.captionLanguage ?? "original") !== "original" && !canUseOpenrouter)
+                        }
+                      >
                         {busy === "cut" ? <Loader2 className="spin" size={16} /> : <Scissors size={16} />}
                         Render Approved
                       </button>
                     </div>
                   </div>
 
+                  <div className="caption-settings-bar">
+                    <div className="caption-setting">
+                      <span>Caption Style</span>
+                      <select
+                        value={detail.project.captionStyle ?? "modern-box"}
+                        onChange={(event) => void updateProjectCaptionSettings(
+                          event.target.value,
+                          detail.project.captionLanguage ?? "original",
+                        )}
+                        disabled={busy !== "idle"}
+                      >
+                        <option value="modern-box">Modern Box</option>
+                        <option value="classic-outline">Classic Outline</option>
+                        <option value="minimal-shadow">Minimal Shadow</option>
+                        <option value="vibrant-cyan">Vibrant Cyan</option>
+                        <option value="vibrant-yellow-box">Vibrant Yellow Box</option>
+                        <option value="vibrant-green">Vibrant Green</option>
+                        <option value="vibrant-red">Vibrant Red</option>
+                      </select>
+                    </div>
+
+                    <div className="caption-setting">
+                      <span>Caption Language</span>
+                      <select
+                        value={detail.project.captionLanguage ?? "original"}
+                        onChange={(event) => void updateProjectCaptionSettings(
+                          detail.project.captionStyle ?? "modern-box",
+                          event.target.value,
+                        )}
+                        disabled={busy !== "idle"}
+                      >
+                        <option value="original">Auto / Original</option>
+                        <option value="english">English</option>
+                        <option value="hindi">Hindi (देवनागरी)</option>
+                        <option value="hinglish">Hinglish (Roman Hindi + English)</option>
+                      </select>
+                    </div>
+
+                    <div className="caption-setting-note">
+                      Full-clip captions are burned into every approved render.
+                      {(detail.project.captionLanguage ?? "original") !== "original"
+                        ? " OpenRouter rewrites the timed captions into the selected language before FFmpeg renders."
+                        : " Auto / Original keeps Whisper's detected wording."}
+                    </div>
+                  </div>
+
+                  {(detail.project.captionLanguage ?? "original") !== "original" && !canUseOpenrouter && (
+                    <div className="api-warning">
+                      ⚠️ English / Hindi / Hinglish caption conversion needs your OpenRouter API key. Add it in API Settings or choose Auto / Original.
+                    </div>
+                  )}
                   {!canUseActiveLlm && (
                     <div className="api-warning">
                       {llmEngine === "local"
@@ -1400,11 +1505,52 @@ function App() {
               </div>
             </div>
 
+            <div className="caption-language-section">
+              <div className="caption-language-header">
+                <h4>Caption Language</h4>
+                <p>Choose how the full spoken clip should appear in burned-in captions.</p>
+              </div>
+
+              <div className="caption-language-options">
+                <button
+                  type="button"
+                  className={selectedCaptionLanguage === "hinglish" ? "selected" : ""}
+                  onClick={() => setSelectedCaptionLanguage("hinglish")}
+                >
+                  <strong>Hinglish</strong>
+                  <span>Roman Hindi + English — best for mixed gaming speech.</span>
+                </button>
+                <button
+                  type="button"
+                  className={selectedCaptionLanguage === "english" ? "selected" : ""}
+                  onClick={() => setSelectedCaptionLanguage("english")}
+                >
+                  <strong>English</strong>
+                  <span>Translate Hindi/Hinglish speech into natural English.</span>
+                </button>
+                <button
+                  type="button"
+                  className={selectedCaptionLanguage === "hindi" ? "selected" : ""}
+                  onClick={() => setSelectedCaptionLanguage("hindi")}
+                >
+                  <strong>Hindi</strong>
+                  <span>Natural Hindi captions in Devanagari script.</span>
+                </button>
+                <button
+                  type="button"
+                  className={selectedCaptionLanguage === "original" ? "selected" : ""}
+                  onClick={() => setSelectedCaptionLanguage("original")}
+                >
+                  <strong>Auto / Original</strong>
+                  <span>Keep Whisper's detected words without translation.</span>
+                </button>
+              </div>
+            </div>
             <div className="style-modal-actions">
               <button className="btn-cancel" onClick={() => { setShowStyleModal(false); setMediaPathToImport(null); }}>
                 Cancel
               </button>
-              <button className="btn-confirm" onClick={() => confirmImport(selectedStyle)}>
+              <button className="btn-confirm" onClick={() => confirmImport(selectedStyle, selectedCaptionLanguage)}>
                 Confirm & Import
               </button>
             </div>

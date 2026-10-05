@@ -99,6 +99,10 @@ impl Database {
         )?;
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN name TEXT", []);
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN caption_style TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE projects ADD COLUMN caption_language TEXT DEFAULT 'original'",
+            [],
+        );
         Ok(())
     }
 
@@ -107,6 +111,7 @@ impl Database {
         source_path: &str,
         transcription_mode: &str,
         caption_style: &str,
+        caption_language: &str,
         source_duration: Option<f64>,
     ) -> Result<Project> {
         let now = Utc::now().to_rfc3339();
@@ -118,14 +123,15 @@ impl Database {
             status: "ingest".to_string(),
             transcription_mode: transcription_mode.to_string(),
             caption_style: Some(caption_style.to_string()),
+            caption_language: Some(caption_language.to_string()),
             created_at: now.clone(),
             updated_at: now,
         };
 
         let conn = self.conn.lock().expect("database mutex poisoned");
         conn.execute(
-            "INSERT INTO projects (id, name, source_path, source_duration, status, transcription_mode, caption_style, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO projects (id, name, source_path, source_duration, status, transcription_mode, caption_style, caption_language, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 project.id,
                 project.name,
@@ -134,6 +140,7 @@ impl Database {
                 project.status,
                 project.transcription_mode,
                 project.caption_style,
+                project.caption_language,
                 project.created_at,
                 project.updated_at
             ],
@@ -145,7 +152,7 @@ impl Database {
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style
+            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style, caption_language
              FROM projects ORDER BY updated_at DESC",
         )?;
 
@@ -157,7 +164,7 @@ impl Database {
     pub fn get_project(&self, project_id: &str) -> Result<Project> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         conn.query_row(
-            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style
+            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style, caption_language
              FROM projects WHERE id = ?1",
             params![project_id],
             project_from_row,
@@ -324,7 +331,8 @@ impl Database {
                 candidates.id, candidates.project_id, candidates.start_sec, candidates.end_sec,
                 candidates.score, candidates.hook, candidates.rationale, candidates.rank, candidates.selected,
                 projects.id, projects.name, projects.source_path, projects.source_duration, projects.status,
-                projects.transcription_mode, projects.created_at, projects.updated_at, projects.caption_style
+                projects.transcription_mode, projects.created_at, projects.updated_at, projects.caption_style,
+                projects.caption_language
              FROM candidates
              INNER JOIN projects ON projects.id = candidates.project_id
              WHERE candidates.id = ?1",
@@ -352,6 +360,7 @@ impl Database {
                     created_at: row.get(15)?,
                     updated_at: row.get(16)?,
                     caption_style: row.get(17)?,
+                    caption_language: row.get(18)?,
                 };
                 Ok((candidate, project))
             },
@@ -398,6 +407,51 @@ impl Database {
         drop(conn);
         self.get_candidate_with_project(candidate_id)
             .map(|(candidate, _)| candidate)
+    }
+
+    pub fn update_project_caption_settings(
+        &self,
+        project_id: &str,
+        caption_style: &str,
+        caption_language: &str,
+    ) -> Result<Project> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "UPDATE projects
+             SET caption_style = ?1, caption_language = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![caption_style, caption_language, now, project_id],
+        )?;
+        conn.execute(
+            "UPDATE clips
+             SET status = 'pending',
+                 output_path = NULL,
+                 face_track_json = NULL,
+                 caption_ass_path = NULL,
+                 render_log = NULL
+             WHERE candidate_id IN (
+                 SELECT id FROM candidates WHERE project_id = ?1
+             )",
+            params![project_id],
+        )?;
+        drop(conn);
+        self.get_project(project_id)
+    }
+
+    pub fn reset_clip_for_candidate(&self, candidate_id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "UPDATE clips
+             SET status = 'pending',
+                 output_path = NULL,
+                 face_track_json = NULL,
+                 caption_ass_path = NULL,
+                 render_log = NULL
+             WHERE candidate_id = ?1",
+            params![candidate_id],
+        )?;
+        Ok(())
     }
 
     pub fn update_clip_for_candidate(
@@ -510,6 +564,7 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
         caption_style: row.get(8)?,
+        caption_language: row.get(9)?,
     })
 }
 

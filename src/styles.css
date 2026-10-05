@@ -1905,3 +1905,125 @@ button:disabled {
     justify-content: flex-start;
   }
 }
+/* Caption language + guaranteed full-clip captions */
+.style-modal {
+  max-height: 92vh;
+  overflow-y: auto;
+}
+
+.caption-settings-bar {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.7fr) minmax(190px, 1fr);
+  gap: 10px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border-color);
+  background: rgba(255, 255, 255, 0.01);
+}
+
+.caption-setting {
+  display: grid;
+  gap: 6px;
+}
+
+.caption-setting > span {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.caption-setting select {
+  width: 100%;
+  min-height: 34px;
+  padding: 0 10px;
+  color: var(--text-primary);
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  outline: none;
+  font: inherit;
+  font-size: 11.5px;
+}
+
+.caption-setting select:focus {
+  border-color: var(--accent-primary);
+}
+
+.caption-setting-note {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.caption-language-section {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+}
+
+.caption-language-header h4 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.caption-language-header p {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.caption-language-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.caption-language-options button {
+  display: grid;
+  gap: 4px;
+  min-height: 68px;
+  padding: 10px 12px;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--border-color);
+  border-radius: 9px;
+  text-align: left;
+}
+
+.caption-language-options button:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+.caption-language-options button.selected {
+  color: var(--text-primary);
+  background: rgba(142, 230, 199, 0.06);
+  border-color: var(--accent-primary);
+}
+
+.caption-language-options strong {
+  color: inherit;
+  font-size: 12px;
+}
+
+.caption-language-options span {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+@media (max-width: 1180px) {
+  .caption-settings-bar,
+  .caption-language-options {
+    grid-template-columns: 1fr;
+  }
+
+  .caption-setting-note {
+    grid-column: 1;
+  }
+}

@@ -40,6 +40,7 @@ pub struct Project {
     pub status: String,
     pub transcription_mode: String,
     pub caption_style: Option<String>,
+    pub caption_language: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

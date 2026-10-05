@@ -289,6 +289,7 @@ fn create_project_from_path(
     path: String,
     transcription_mode: String,
     caption_style: String,
+    caption_language: String,
 ) -> Result<Project, String> {
     validate_media_extension(&path).map_err(to_command_error)?;
     let probe = media::probe_media(&path).ok();
@@ -299,6 +300,7 @@ fn create_project_from_path(
             &path,
             &transcription_mode,
             &caption_style,
+            &caption_language,
             probe.and_then(|probe| probe.duration_sec),
         )
         .map_err(to_command_error)
@@ -634,121 +636,241 @@ fn update_candidate_timing(
 }
 
 #[tauri::command]
+fn update_project_caption_settings(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    caption_style: String,
+    caption_language: String,
+) -> Result<Project, String> {
+    let allowed_styles = [
+        "modern-box",
+        "classic-outline",
+        "minimal-shadow",
+        "vibrant-cyan",
+        "vibrant-yellow-box",
+        "vibrant-green",
+        "vibrant-red",
+    ];
+    let allowed_languages = ["original", "english", "hindi", "hinglish"];
+
+    if !allowed_styles.contains(&caption_style.as_str()) {
+        return Err("Unsupported caption style.".to_string());
+    }
+    if !allowed_languages.contains(&caption_language.as_str()) {
+        return Err("Unsupported caption language.".to_string());
+    }
+
+    state
+        .db
+        .update_project_caption_settings(&project_id, &caption_style, &caption_language)
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
 async fn render_flat_clip_for_candidate(
     state: tauri::State<'_, AppState>,
     candidate_id: String,
+    caption_api_key: Option<String>,
+    caption_model_name: Option<String>,
 ) -> Result<String, String> {
     let db = state.db.clone();
     let data_dir = state.data_dir.clone();
 
-    tokio::task::spawn_blocking(move || {
-        let (candidate, project) = db
-            .get_candidate_with_project(&candidate_id)
-            .map_err(to_command_error)?;
-        db
-            .update_clip_for_candidate(&candidate_id, "cutting", None, None, None)
-            .map_err(to_command_error)?;
+    let (candidate, project) = db
+        .get_candidate_with_project(&candidate_id)
+        .map_err(to_command_error)?;
 
-        let output_path = documents_project_dir(&project)?
-            .join("clips")
-            .join(format!("clip-{:02}_flat.mp4", candidate.rank));
+    db.reset_clip_for_candidate(&candidate_id)
+        .map_err(to_command_error)?;
+    db.update_clip_for_candidate(&candidate_id, "cutting", None, None, None)
+        .map_err(to_command_error)?;
 
-        let mut srt_path = None;
-        let mut drawtext_filters = None;
-
-        let probe = media::probe_media(&project.source_path).ok();
-        let cropped_width = if let Some(p) = &probe {
-            let iw = p.width.unwrap_or(1920) as f64;
-            let ih = p.height.unwrap_or(1080) as f64;
-            let w = (iw.min(ih * 9.0 / 16.0) / 2.0).floor() * 2.0;
-            w as i64
-        } else {
-            1080
-        };
-
-        if let Ok(Some(transcript_record)) = db.latest_transcript(&project.id) {
-            if let Ok(normalized) = serde_json::from_str::<NormalizedTranscript>(&transcript_record.raw_json) {
-                let srt_content = generate_srt(&normalized.words, candidate.start_sec, candidate.end_sec);
-                let clip_srt_path = data_dir.join("projects").join(&project.id).join(format!("clip-{}.srt", candidate.id));
-                if std::fs::write(&clip_srt_path, srt_content).is_ok() {
-                    srt_path = Some(clip_srt_path);
-                }
-                let style = project.caption_style.as_deref().unwrap_or("modern-box");
-                let drawtext = build_drawtext_filters(
-                    &normalized.words,
-                    candidate.start_sec,
-                    candidate.end_sec,
-                    cropped_width,
-                    style,
-                );
-                if !drawtext.is_empty() {
-                    drawtext_filters = Some(drawtext);
-                }
-            }
+    let transcript_record = match db.latest_transcript(&project.id).map_err(to_command_error)? {
+        Some(value) => value,
+        None => {
+            let message = "Cannot render captions because this project has no transcript.".to_string();
+            let _ = db.update_clip_for_candidate(&candidate_id, "error", None, None, Some(&message));
+            return Err(message);
         }
+    };
 
-        match media::render_flat_clip(
-            &project.source_path,
+    let normalized = match serde_json::from_str::<NormalizedTranscript>(&transcript_record.raw_json) {
+        Ok(value) => value,
+        Err(error) => {
+            let message = format!("Could not read transcript for caption rendering: {error}");
+            let _ = db.update_clip_for_candidate(&candidate_id, "error", None, None, Some(&message));
+            return Err(message);
+        }
+    };
+
+    let caption_language = project
+        .caption_language
+        .as_deref()
+        .unwrap_or("original")
+        .to_lowercase();
+
+    let mut caption_words = normalized.words.clone();
+
+    if caption_language != "original" {
+        let source_chunks = build_caption_source_chunks(
+            &normalized.words,
             candidate.start_sec,
             candidate.end_sec,
-            &output_path,
-            drawtext_filters.as_deref(),
-        ) {
-            Ok(path) => {
-                let path_string = path.to_string_lossy().to_string();
-                let srt_string = srt_path.map(|p| p.to_string_lossy().to_string());
-                db
-                    .update_clip_for_candidate(
-                        &candidate_id,
-                        "done",
-                        Some(&path_string),
-                        srt_string.as_deref(),
-                        None,
-                    )
-                    .map_err(to_command_error)?;
-                Ok(path_string)
-            }
-            Err(error) => {
-                let err_msg = error.to_string();
-                // Fallback retry rendering without captions overlay on any error
-                match media::render_flat_clip(
-                    &project.source_path,
-                    candidate.start_sec,
-                    candidate.end_sec,
-                    &output_path,
-                    None,
-                ) {
-                    Ok(path) => {
-                        let path_string = path.to_string_lossy().to_string();
-                        let srt_string = srt_path.map(|p| p.to_string_lossy().to_string());
-                        let warning_msg = format!(
-                            "Clip rendered successfully, but captions were skipped. Error: {}",
-                            err_msg
-                        );
-                        db
-                            .update_clip_for_candidate(
-                                &candidate_id,
-                                "done",
-                                Some(&path_string),
-                                srt_string.as_deref(),
-                                Some(&warning_msg),
-                            )
-                            .map_err(to_command_error)?;
-                        Ok(path_string)
-                    }
-                    Err(retry_err) => {
-                        let message = retry_err.to_string();
-                        db
-                            .update_clip_for_candidate(&candidate_id, "error", None, None, Some(&message))
-                            .map_err(to_command_error)?;
-                        Err(message)
-                    }
-                }
-            }
+        );
+
+        if source_chunks.is_empty() {
+            let message = "No spoken words were found inside this candidate, so captions cannot be generated.".to_string();
+            let _ = db.update_clip_for_candidate(&candidate_id, "error", None, None, Some(&message));
+            return Err(message);
         }
+
+        let key = match caption_api_key
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok().filter(|value| !value.trim().is_empty()))
+        {
+            Some(value) => value,
+            None => {
+                let message = format!(
+                    "Caption language '{}' requires your OpenRouter API key. Original/Auto captions work without translation.",
+                    caption_language
+                );
+                let _ = db.update_clip_for_candidate(&candidate_id, "error", None, None, Some(&message));
+                return Err(message);
+            }
+        };
+
+        let source_lines = source_chunks
+            .iter()
+            .map(|chunk| chunk.text.clone())
+            .collect::<Vec<_>>();
+
+        let rewritten = match llm::rewrite_caption_lines_with_openrouter(
+            &source_lines,
+            &caption_language,
+            &key,
+            caption_model_name.as_deref(),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let message = format!(
+                    "Caption language conversion failed. The clip was NOT rendered without captions. {error}"
+                );
+                let _ = db.update_clip_for_candidate(&candidate_id, "error", None, None, Some(&message));
+                return Err(message);
+            }
+        };
+
+        caption_words = caption_chunks_to_words(&source_chunks, &rewritten);
+    }
+
+    let srt_content = generate_srt(
+        &caption_words,
+        candidate.start_sec,
+        candidate.end_sec,
+    );
+    if srt_content.trim().is_empty() {
+        let message = "Caption generation produced no subtitle text. The clip was not rendered.".to_string();
+        let _ = db.update_clip_for_candidate(&candidate_id, "error", None, None, Some(&message));
+        return Err(message);
+    }
+
+    let clip_data_dir = data_dir.join("projects").join(&project.id);
+    if let Err(error) = std::fs::create_dir_all(&clip_data_dir) {
+        let message = format!("Could not create caption directory: {error}");
+        let _ = db.update_clip_for_candidate(&candidate_id, "error", None, None, Some(&message));
+        return Err(message);
+    }
+
+    let clip_srt_path = clip_data_dir.join(format!("clip-{}.srt", candidate.id));
+    if let Err(error) = std::fs::write(&clip_srt_path, srt_content) {
+        let message = format!("Could not save generated captions: {error}");
+        let _ = db.update_clip_for_candidate(&candidate_id, "error", None, None, Some(&message));
+        return Err(message);
+    }
+
+    let probe = media::probe_media(&project.source_path).ok();
+    let cropped_width = if let Some(p) = &probe {
+        let iw = p.width.unwrap_or(1920) as f64;
+        let ih = p.height.unwrap_or(1080) as f64;
+        let w = (iw.min(ih * 9.0 / 16.0) / 2.0).floor() * 2.0;
+        w as i64
+    } else {
+        1080
+    };
+
+    let style = project.caption_style.as_deref().unwrap_or("modern-box");
+    let drawtext_filters = build_drawtext_filters(
+        &caption_words,
+        candidate.start_sec,
+        candidate.end_sec,
+        cropped_width,
+        style,
+    );
+
+    if drawtext_filters.trim().is_empty() {
+        let message = "Caption overlay could not be built. The clip was NOT rendered without captions.".to_string();
+        let _ = db.update_clip_for_candidate(&candidate_id, "error", None, None, Some(&message));
+        return Err(message);
+    }
+
+    let output_path = documents_project_dir(&project)?
+        .join("clips")
+        .join(format!("clip-{:02}_flat.mp4", candidate.rank));
+
+    let source_path = project.source_path.clone();
+    let start_sec = candidate.start_sec;
+    let end_sec = candidate.end_sec;
+    let render_output_path = output_path.clone();
+    let render_filters = drawtext_filters.clone();
+
+    let render_result = tokio::task::spawn_blocking(move || {
+        media::render_flat_clip(
+            &source_path,
+            start_sec,
+            end_sec,
+            &render_output_path,
+            Some(&render_filters),
+        )
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|error| error.to_string())?;
+
+    match render_result {
+        Ok(path) => {
+            let path_string = path.to_string_lossy().to_string();
+            let srt_string = clip_srt_path.to_string_lossy().to_string();
+            let caption_log = format!(
+                "Captions burned into the full clip successfully. Language: {}. Style: {}.",
+                caption_language, style
+            );
+            db.update_clip_for_candidate(
+                &candidate_id,
+                "done",
+                Some(&path_string),
+                Some(&srt_string),
+                Some(&caption_log),
+            )
+            .map_err(to_command_error)?;
+            Ok(path_string)
+        }
+        Err(error) => {
+            let message = format!(
+                "Caption render failed. The app did NOT silently export a caption-less clip. {}",
+                error
+            );
+            let srt_string = clip_srt_path.to_string_lossy().to_string();
+            let _ = db.update_clip_for_candidate(
+                &candidate_id,
+                "error",
+                None,
+                Some(&srt_string),
+                Some(&message),
+            );
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
@@ -796,6 +918,7 @@ pub fn run() {
             set_selected_clip_count,
             set_candidate_selected,
             update_candidate_timing,
+            update_project_caption_settings,
             render_flat_clip_for_candidate,
             delete_project,
             rename_project,
@@ -979,6 +1102,108 @@ fn to_command_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+#[derive(Debug, Clone)]
+struct CaptionSourceChunk {
+    start: f64,
+    end: f64,
+    text: String,
+}
+
+fn build_caption_source_chunks(
+    words: &[TranscriptWord],
+    start_sec: f64,
+    end_sec: f64,
+) -> Vec<CaptionSourceChunk> {
+    let candidate_words = words
+        .iter()
+        .filter(|word| word.end > start_sec && word.start < end_sec)
+        .collect::<Vec<_>>();
+
+    candidate_words
+        .chunks(3)
+        .filter_map(|chunk| {
+            let first = chunk.first()?;
+            let last = chunk.last()?;
+            let start = first.start.max(start_sec);
+            let end = last.end.min(end_sec);
+            if end <= start {
+                return None;
+            }
+
+            let text = chunk
+                .iter()
+                .map(|word| word.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            if text.is_empty() {
+                None
+            } else {
+                Some(CaptionSourceChunk { start, end, text })
+            }
+        })
+        .collect()
+}
+
+fn caption_chunks_to_words(
+    chunks: &[CaptionSourceChunk],
+    rewritten: &[String],
+) -> Vec<TranscriptWord> {
+    let mut words = Vec::new();
+
+    for (chunk, text) in chunks.iter().zip(rewritten.iter()) {
+        let tokens = text
+            .split_whitespace()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+
+        if tokens.is_empty() {
+            continue;
+        }
+
+        let duration = (chunk.end - chunk.start).max(0.01);
+        let step = duration / tokens.len() as f64;
+
+        for (index, token) in tokens.iter().enumerate() {
+            let start = chunk.start + step * index as f64;
+            let end = if index + 1 == tokens.len() {
+                chunk.end
+            } else {
+                chunk.start + step * (index + 1) as f64
+            };
+
+            words.push(TranscriptWord {
+                text: (*token).to_string(),
+                start,
+                end,
+                speaker: None,
+            });
+        }
+    }
+
+    words
+}
+
+fn escape_drawtext_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+
+    for ch in text.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\'' => escaped.push_str("\\'"),
+            ':' => escaped.push_str("\\:"),
+            ',' => escaped.push_str("\\,"),
+            '%' => escaped.push_str("\\%"),
+            '\r' | '\n' => escaped.push(' '),
+            _ => escaped.push(ch),
+        }
+    }
+
+    escaped
+}
+
 fn generate_srt(words: &[TranscriptWord], start_sec: f64, end_sec: f64) -> String {
     let mut srt = String::new();
     let mut index = 1;
@@ -1050,6 +1275,10 @@ fn build_drawtext_filters(
         "/System/Library/Fonts/Avenir Next.ttc".to_string(),
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf".to_string(),
         "/System/Library/Fonts/Helvetica.ttc".to_string(),
+        // Windows Unicode / Hindi + Latin coverage
+        "C:/Windows/Fonts/NirmalaB.ttf".to_string(),
+        "C:/Windows/Fonts/Nirmala.ttf".to_string(),
+        "C:/Windows/Fonts/mangal.ttf".to_string(),
         // Windows standard
         "C:/Windows/Fonts/SegoeUIb.ttf".to_string(),
         "C:/Windows/Fonts/segoeuib.ttf".to_string(),
@@ -1103,10 +1332,9 @@ fn build_drawtext_filters(
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Clean text to avoid breaking filter parameters
-        let clean_text: String = text.chars()
-            .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '!' || *c == '?')
-            .collect();
+        // Preserve Unicode (including Hindi vowel marks) and escape only
+        // characters that can break FFmpeg's drawtext filter parser.
+        let clean_text = escape_drawtext_text(&text);
 
         // Responsive font size and padding box
         let fontsize = ((cropped_width as f64) * 0.075).clamp(16.0, 80.0).round() as i64;
